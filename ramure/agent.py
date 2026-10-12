@@ -63,6 +63,29 @@ class Agent:
         """Deliver a user-style message to this agent."""
         self.log.emit("message", {"text": text})
 
+    async def compact(
+        self,
+        instructions: str | None = None,
+        continue_message: str | None = None,
+    ) -> None:
+        """Request a context compaction of this agent's pi session.
+
+        The extension defers the compaction to the agent's next turn
+        boundary (compacting mid-turn would abort in-flight tool work),
+        then delivers ``continue_message`` so the agent resumes from the
+        compacted context. ``instructions`` customizes pi's compaction
+        summary. A ``compaction`` event appears in the agent log when it
+        completes; ``compaction_error`` if pi refuses (e.g. session too
+        small).
+        """
+        self.log.emit(
+            "compact",
+            {
+                "instructions": instructions or "",
+                "continue_message": continue_message or "",
+            },
+        )
+
     async def exec(
         self, command: str, *, user: str = "agent", timeout: int | None = None
     ) -> ExecResult:

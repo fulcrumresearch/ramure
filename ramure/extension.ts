@@ -142,6 +142,22 @@ const pendingCalls = new Map<string, {
   reject: (error: Error) => void;
 }>();
 
+// Pending compaction request from the server. Compaction aborts any
+// in-flight agent operation, so a request received mid-turn is deferred
+// to the next turn boundary instead of firing immediately.
+let pendingCompact: { instructions: string; continueMessage: string } | null = null;
+let compactInFlight = false;
+// Optional token-threshold trigger: compact whenever estimated context
+// exceeds this many tokens, checked at turn boundaries. pi's own
+// auto-compaction is only checked when the agent idles or a prompt is
+// sent, which never happens mid-run for continuous tool-loop agents.
+// 0 = disabled.
+const compactContextTokens = Math.max(
+  0,
+  parseInt(process.env.RAMURE_COMPACT_CONTEXT_TOKENS || "0", 10) || 0,
+);
+const COMPACT_CONTINUE_MESSAGE = "Your context was compacted. Continue.";
+
 function nextCallId(): string {
   return `tc-${++callIdCounter}`;
 }
@@ -187,6 +203,48 @@ function registerRemoteTool(pi: ExtensionAPI, tool: RemoteTool, registeredTools:
 
   pi.registerTool(definition);
   registeredTools.add(tool.name);
+}
+
+// -- Compaction --
+
+// Manual compaction aborts the agent loop, so after it finishes (or
+// fails: ``session.compact`` aborts before it can throw "nothing to
+// compact") the agent sits idle and needs ``continueMessage`` to resume.
+function runPendingCompact(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  if (!pendingCompact || compactInFlight) return;
+  const { instructions, continueMessage } = pendingCompact;
+  pendingCompact = null;
+  compactInFlight = true;
+  const resume = () => {
+    compactInFlight = false;
+    if (continueMessage) {
+      if (ctx.isIdle()) {
+        pi.sendUserMessage(continueMessage);
+      } else {
+        pi.sendUserMessage(continueMessage, { deliverAs: "steer" });
+      }
+    }
+  };
+  sendEvent("compaction_invoking", {});
+  try {
+    ctx.compact({
+      customInstructions: instructions || undefined,
+      onComplete: (result) => {
+        sendEvent("compaction_complete", {
+          tokens_before: numberOrNull((result as any)?.tokensBefore),
+          summary_chars: typeof (result as any)?.summary === "string" ? (result as any).summary.length : null,
+        });
+        resume();
+      },
+      onError: (error) => {
+        sendEvent("compaction_error", { error: String(error?.message || error) });
+        resume();
+      },
+    });
+  } catch (error: any) {
+    sendEvent("compaction_error", { error: "invoke failed: " + String(error?.message || error) });
+    compactInFlight = false;
+  }
 }
 
 // -- Log entry handling --
@@ -256,6 +314,18 @@ function handleLogEntry(
         } else {
           pi.sendUserMessage(text, { deliverAs: "steer" });
         }
+      }
+      break;
+    }
+
+    case "compact": {
+      pendingCompact = {
+        instructions: String(entry.data?.instructions || ""),
+        continueMessage: String(entry.data?.continue_message || ""),
+      };
+      sendEvent("compact_received", { idle: ctx.isIdle() });
+      if (ctx.isIdle()) {
+        runPendingCompact(pi, ctx);
       }
       break;
     }
@@ -338,8 +408,32 @@ function setupActivityForwarding(pi: ExtensionAPI): void {
     sendEvent("turn_start", { turn_index: event.turnIndex });
   });
 
-  pi.on("turn_end", async (event) => {
+  pi.on("turn_end", async (event, ctx) => {
     sendEvent("turn_end", { turn_index: event.turnIndex });
+    // Token-threshold trigger: pi's native auto-compaction is only checked
+    // when the agent idles or a prompt is sent, which a continuous tool
+    // loop never hits — so check the context estimate here instead.
+    if (compactContextTokens > 0 && !pendingCompact && !compactInFlight) {
+      const usage = ctx.getContextUsage?.();
+      const tokens = usage && typeof usage.tokens === "number" ? usage.tokens : null;
+      if (tokens !== null && tokens > compactContextTokens) {
+        sendEvent("compact_token_trigger", { tokens, threshold: compactContextTokens });
+        pendingCompact = { instructions: "", continueMessage: COMPACT_CONTINUE_MESSAGE };
+      }
+    }
+    // Fire deferred compaction at the turn boundary, where aborting the
+    // agent loop loses no in-flight tool work.
+    runPendingCompact(pi, ctx);
+  });
+
+  pi.on("session_compact", async (event) => {
+    const entry = (event as any).compactionEntry || {};
+    sendEvent("compaction", {
+      from_extension: Boolean((event as any).fromExtension),
+      tokens_before: numberOrNull(entry.tokensBefore),
+      summary_chars: typeof entry.summary === "string" ? entry.summary.length : null,
+      first_kept_entry_id: entry.firstKeptEntryId ?? null,
+    });
   });
 
   pi.on("message_start", async (event) => {

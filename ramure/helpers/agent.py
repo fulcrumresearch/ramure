@@ -99,6 +99,9 @@ async def launch_agent(
         env["RAMURE_TOOL_RESULT_MAX_BYTES"] = os.environ["RAMURE_TOOL_RESULT_MAX_BYTES"]
     if os.environ.get("RAMURE_MESSAGE_MAX_BYTES"):
         env["RAMURE_MESSAGE_MAX_BYTES"] = os.environ["RAMURE_MESSAGE_MAX_BYTES"]
+    # Token-threshold compaction trigger for the extension; 0/unset = off.
+    if os.environ.get("RAMURE_COMPACT_CONTEXT_TOKENS"):
+        env["RAMURE_COMPACT_CONTEXT_TOKENS"] = os.environ["RAMURE_COMPACT_CONTEXT_TOKENS"]
     if proxy_url and proxy_token:
         # Route provider traffic through ramure's host-side model proxy. The
         # extension reads RAMURE_PROXY_URL and points the provider baseUrls at
@@ -116,6 +119,7 @@ async def launch_agent(
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
+            "MOONSHOT_API_KEY",
         ):
             value = os.environ.get(key)
             if value:
